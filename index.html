@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Doodle Jump Mini App</title>
+  <style>
+    html, body { margin:0; padding:0; height:100%; background:#0b1020; overflow:hidden; }
+    canvas { display:block; width:100vw; height:100vh; touch-action:none; }
+    .hud{
+      position:fixed; left:0; top:0; right:0; padding:10px 12px;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      color: rgba(255,255,255,0.92);
+      display:flex; justify-content:space-between; align-items:center;
+      pointer-events:none;
+      text-shadow: 0 2px 10px rgba(0,0,0,0.35);
+    }
+    .hint{
+      position:fixed; left:50%; bottom:14px; transform:translateX(-50%);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      color: rgba(255,255,255,0.85);
+      background: rgba(0,0,0,0.35);
+      padding:8px 12px; border-radius:999px;
+      pointer-events:none;
+      backdrop-filter: blur(6px);
+    }
+    .btn{
+      position:fixed; right:12px; bottom:12px;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      font-weight:700;
+      color:#0b1020;
+      background: rgba(255,255,255,0.92);
+      border-radius:14px;
+      padding:10px 12px;
+      user-select:none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .btn:active{ transform: scale(0.98); }
+  </style>
+</head>
+<body>
+  <div class="hud">
+    <div id="score">Score: 0</div>
+    <div id="best">Best: 0</div>
+  </div>
+  <div class="hint" id="hint">Тяни пальцем влево/вправо (или наклоняй телефон) — прыгай вверх</div>
+  <div class="btn" id="restart" style="display:none;">Restart</div>
+  <canvas id="c"></canvas>
+
+  <!-- Telegram WebApp (не обязателен в браузере, но нужен в мини-аппе) -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script>
+  (() => {
+    const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+    if (tg) {
+      tg.ready();
+      tg.expand();
+      // тёмная тема — ок, у нас свой фон
+      try { tg.setHeaderColor("#0b1020"); tg.setBackgroundColor("#0b1020"); } catch(e){}
+    }
+
+    const canvas = document.getElementById("c");
+    const ctx = canvas.getContext("2d", { alpha: false });
+
+    const uiScore = document.getElementById("score");
+    const uiBest  = document.getElementById("best");
+    const hintEl  = document.getElementById("hint");
+    const restartBtn = document.getElementById("restart");
+
+    // --- Assets
+    const imgPlat = new Image();
+    const imgPers = new Image();
+    imgPlat.src = "plat.png";
+    imgPers.src = "pers.png";
+
+    // --- Game state
+    let W=0, H=0, DPR=1;
+    let running = true;
+    let gameOver = false;
+
+    const world = {
+      gravity: 0.45,
+      jumpVel: -12.2,
+      moveAcc: 0.55,       // ускорение от ввода
+      maxSpeed: 7.0,
+      friction: 0.92,
+      camY: 0
+    };
+
+    const player = {
+      x: 0, y: 0,
+      vx: 0, vy: 0,
+      w: 46, h: 46,
+      facing: 1
+    };
+
+    const platforms = [];
+    const clouds = [];
+
+    let score = 0;
+    let best = Number(localStorage.getItem("dj_best") || 0);
+    uiBest.textContent = "Best: " + best;
+
+    // input
+    let inputX = 0; // -1..1
+    let touchActive = false;
+    let touchStartX = 0;
+
+    // helpers
+    const rand = (a,b)=> a + Math.random()*(b-a);
+    const clamp = (v,a,b)=> Math.max(a, Math.min(b, v));
+
+    function resize() {
+      DPR = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+      W = Math.floor(window.innerWidth);
+      H = Math.floor(window.innerHeight);
+      canvas.width  = Math.floor(W * DPR);
+      canvas.height = Math.floor(H * DPR);
+      canvas.style.width  = W + "px";
+      canvas.style.height = H + "px";
+      ctx.setTransform(DPR,0,0,DPR,0,0);
+
+      // подстройка размеров персонажа под экран
+      const base = Math.min(W, H);
+      player.w = clamp(base * 0.09, 36, 60);
+      player.h = player.w;
+
+      // если уже играли — не ломаем расстановку, только границы
+    }
+
+    function reset() {
+      running = true;
+      gameOver = false;
+      restartBtn.style.display = "none";
+      hintEl.style.display = "block";
+      score = 0;
+      uiScore.textContent = "Score: 0";
+
+      world.camY = 0;
+
+      player.x = W/2;
+      player.y = H*0.65;
+      player.vx = 0;
+      player.vy = world.jumpVel * 0.9;
+
+      platforms.length = 0;
+      clouds.length = 0;
+
+      // стартовые платформы
+      const gapMin = 70, gapMax = 110;
+      let y = H*0.78;
+      for (let i=0;i<12;i++){
+        addPlatform(rand(40, W-40), y, i===0 ? "start" : "normal");
+        y -= rand(gapMin, gapMax);
+      }
+      // облака
+      for (let i=0;i<10;i++){
+        clouds.push({
+          x: rand(0,W),
+          y: rand(0,H),
+          s: rand(0.6,1.5),
+          v: rand(0.12,0.35)
+        });
+      }
+    }
+
+    function platSize() {
+      // платформа по ширине примерно как в Doodle Jump, но зависит от экрана
+      const w = clamp(W * 0.22, 78, 140);
+      const h = w * 0.28;
+      return {w, h};
+    }
+
+    function addPlatform(x, y, type="normal") {
+      const {w,h} = platSize();
+      platforms.push({
+        x: clamp(x, w*0.5, W - w*0.5),
+        y,
+        w, h,
+        vx: type==="moving" ? rand(0.6, 1.4) * (Math.random()<0.5?-1:1) : 0,
+        type
+      });
+    }
+
+    function spawnAbove() {
+      // держим запас платформ над камерой
+      const {w} = platSize();
+      const topY = Math.min(...platforms.map(p=>p.y));
+      const needAbove = world.camY - 600;
+      while (topY > needAbove && platforms.length < 80) {
+        // (здесь topY константа — поэтому делаем loop иначе)
+        break;
+      }
+      // более корректно: пока самая верхняя платформа "не достаточно" высоко — добавляем
+      while (Math.min(...platforms.map(p=>p.y)) > world.camY - 900) {
+        const lastTop = Math.min(...platforms.map(p=>p.y));
+        const gap = rand(75, 125);
+        const ny = lastTop - gap;
+        const nx = rand(w*0.5, W - w*0.5);
+        const r = Math.random();
+        const type = r < 0.18 ? "moving" : "normal";
+        addPlatform(nx, ny, type);
+      }
+
+      // чистим платформы, которые далеко внизу
+      for (let i=platforms.length-1;i>=0;i--){
+        if (platforms[i].y > world.camY + H + 200) platforms.splice(i,1);
+      }
+    }
+
+    function drawBackground() {
+      // градиент неба
+      const g = ctx.createLinearGradient(0,0,0,H);
+      g.addColorStop(0, "#0b1020");
+      g.addColorStop(0.55, "#122a55");
+      g.addColorStop(1, "#15406b");
+      ctx.fillStyle = g;
+      ctx.fillRect(0,0,W,H);
+
+      // звёзды (лёгкий шум)
+      ctx.globalAlpha = 0.22;
+      for (let i=0;i<60;i++){
+        const x = (i*97) % W;
+        const y = ((i*233) % H) * 0.55;
+        ctx.fillStyle = "white";
+        ctx.fillRect(x, y, 1, 1);
+      }
+      ctx.globalAlpha = 1;
+
+      // облака
+      for (const c of clouds) {
+        const y = c.y - (world.camY * 0.08); // параллакс
+        const x = c.x;
+        const s = c.s;
+        const r = 18*s;
+        ctx.globalAlpha = 0.25;
+        ctx.fillStyle = "white";
+        blob(x, y, r);
+        blob(x + 22*s, y+6*s, r*0.9);
+        blob(x - 20*s, y+8*s, r*0.85);
+        ctx.globalAlpha = 1;
+      }
+
+      function blob(x,y,r){
+        ctx.beginPath();
+        ctx.arc(x,y,r,0,Math.PI*2);
+        ctx.fill();
+      }
+    }
+
+    function drawPlatform(p) {
+      const px = p.x - p.w/2;
+      const py = p.y - world.camY;
+
+      // если plat.png не загрузился — рисуем запасной вариант
+      if (imgPlat.complete && imgPlat.naturalWidth > 0) {
+        ctx.drawImage(imgPlat, px, py, p.w, p.h);
+      } else {
+        ctx.fillStyle = "rgba(255,255,255,0.85)";
+        ctx.fillRect(px, py, p.w, p.h);
+        ctx.fillStyle = "rgba(0,0,0,0.15)";
+        ctx.fillRect(px, py + p.h*0.7, p.w, p.h*0.3);
+      }
+
+      // индикатор moving (не обязателен, но полезно)
+      if (p.type === "moving") {
+        ctx.globalAlpha = 0.25;
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(px, py - 3, p.w, 2);
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    function drawPlayer() {
+      const px = player.x - player.w/2;
+      const py = player.y - world.camY - player.h/2;
+
+      // если pers.png не загрузился — рисуем круг
+      if (imgPers.complete && imgPers.naturalWidth > 0) {
+        // зеркалим по направлению
+        if (player.facing < 0) {
+          ctx.save();
+          ctx.translate(px + player.w/2, 0);
+          ctx.scale(-1, 1);
+          ctx.drawImage(imgPers, -player.w/2, py, player.w, player.h);
+          ctx.restore();
+        } else {
+          ctx.drawImage(imgPers, px, py, player.w, player.h);
+        }
+      } else {
+        ctx.fillStyle = "rgba(255,255,255,0.9)";
+        ctx.beginPath();
+        ctx.arc(player.x, py + player.h/2, player.w/2, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+
+    function update() {
+      if (!running) return;
+
+      // движение облаков
+      for (const c of clouds) {
+        c.x += c.v;
+        if (c.x > W + 40) c.x = -40;
+      }
+
+      // ввод -> ускорение
+      const ax = inputX * world.moveAcc;
+      player.vx += ax;
+      player.vx = clamp(player.vx, -world.maxSpeed, world.maxSpeed);
+
+      // трение если нет ввода
+      if (Math.abs(inputX) < 0.02) player.vx *= world.friction;
+
+      // физика
+      player.vy += world.gravity;
+      player.x += player.vx;
+      player.y += player.vy;
+
+      if (player.vx > 0.2) player.facing = 1;
+      if (player.vx < -0.2) player.facing = -1;
+
+      // wrap по краям как в Doodle Jump
+      if (player.x < -player.w/2) player.x = W + player.w/2;
+      if (player.x > W + player.w/2) player.x = -player.w/2;
+
+      // платформы (движущиеся)
+      for (const p of platforms) {
+        if (p.type === "moving") {
+          p.x += p.vx;
+          const half = p.w/2;
+          if (p.x < half || p.x > W-half) p.vx *= -1;
+        }
+      }
+
+      // коллизия: только когда падаем вниз
+      if (player.vy > 0) {
+        const footY = player.y + player.h/2;
+        const prevFootY = (player.y - player.vy) + player.h/2;
+
+        for (const p of platforms) {
+          const py = p.y;
+          const pxL = p.x - p.w/2;
+          const pxR = p.x + p.w/2;
+
+          // пересечение по Y (перелетели сверху на платформу)
+          const crossed = prevFootY <= py && footY >= py;
+          if (!crossed) continue;
+
+          // пересечение по X
+          const playerLeft  = player.x - player.w*0.40;
+          const playerRight = player.x + player.w*0.40;
+          const overlapX = playerRight >= pxL && playerLeft <= pxR;
+          if (!overlapX) continue;
+
+          // приземлились
+          player.y = py - player.h/2;
+          player.vy = world.jumpVel;
+
+          // скрываем подсказку после первого удачного прыжка
+          hintEl.style.display = "none";
+          break;
+        }
+      }
+
+      // камера: держим игрока в верхней части экрана
+      const targetTop = world.camY + H*0.35;
+      if (player.y < targetTop) {
+        const delta = targetTop - player.y;
+        world.camY -= delta;
+
+        // скоринг по подъему
+        score = Math.max(score, Math.floor((-world.camY) * 0.2));
+        uiScore.textContent = "Score: " + score;
+
+        if (score > best) {
+          best = score;
+          localStorage.setItem("dj_best", best);
+          uiBest.textContent = "Best: " + best;
+        }
+      }
+
+      // спавн/чистка платформ
+      spawnAbove();
+
+      // проигрыш: упали ниже экрана
+      if (player.y - world.camY > H + 120) {
+        running = false;
+        gameOver = true;
+        restartBtn.style.display = "block";
+        hintEl.textContent = "Game Over — нажми Restart";
+        hintEl.style.display = "block";
+        try { if (tg) tg.HapticFeedback.impactOccurred("heavy"); } catch(e){}
+      }
+    }
+
+    function render() {
+      drawBackground();
+
+      // платформы
+      for (const p of platforms) {
+        // пропускаем если далеко за экраном
+        const sy = p.y - world.camY;
+        if (sy < -200 || sy > H + 200) continue;
+        drawPlatform(p);
+      }
+
+      // персонаж
+      drawPlayer();
+
+      // лёгкая виньетка
+      ctx.globalAlpha = 0.18;
+      const vg = ctx.createRadialGradient(W/2, H/2, Math.min(W,H)*0.2, W/2, H/2, Math.max(W,H)*0.75);
+      vg.addColorStop(0, "rgba(0,0,0,0)");
+      vg.addColorStop(1, "rgba(0,0,0,1)");
+      ctx.fillStyle = vg;
+      ctx.fillRect(0,0,W,H);
+      ctx.globalAlpha = 1;
+    }
+
+    function loop() {
+      update();
+      render();
+      requestAnimationFrame(loop);
+    }
+
+    // --- Touch controls (drag left/right)
+    canvas.addEventListener("pointerdown", (e) => {
+      touchActive = true;
+      touchStartX = e.clientX;
+      canvas.setPointerCapture(e.pointerId);
+    });
+    canvas.addEventListener("pointermove", (e) => {
+      if (!touchActive) return;
+      const dx = e.clientX - touchStartX;
+      // Нормализация: 120px = полный ввод
+      inputX = clamp(dx / 120, -1, 1);
+    });
+    canvas.addEventListener("pointerup", (e) => {
+      touchActive = false;
+      inputX = 0;
+      try { canvas.releasePointerCapture(e.pointerId); } catch(_){}
+    });
+    canvas.addEventListener("pointercancel", () => {
+      touchActive = false;
+      inputX = 0;
+    });
+
+    // --- Tilt controls (если доступно)
+    // На iOS внутри WebView иногда надо разрешение — оставим как “приятный бонус”
+    window.addEventListener("deviceorientation", (e) => {
+      // gamma: наклон влево/вправо
+      if (e.gamma == null) return;
+      const g = clamp(e.gamma / 25, -1, 1);
+      // если пользователь не трогает экран — используем наклон сильнее
+      if (!touchActive) inputX = g;
+    }, { passive:true });
+
+    // restart
+    restartBtn.addEventListener("click", () => {
+      reset();
+    });
+
+    // prevent scroll / bounce
+    document.addEventListener("touchmove", (e) => e.preventDefault(), { passive:false });
+
+    // boot
+    resize();
+    window.addEventListener("resize", () => { resize(); });
+
+    // стартуем, когда картинки прогрузятся или через таймаут
+    let started = false;
+    function startOnce(){
+      if (started) return;
+      started = true;
+      reset();
+      loop();
+    }
+    imgPlat.onload = startOnce;
+    imgPers.onload = startOnce;
+    setTimeout(startOnce, 800); // если изображения не успели — всё равно стартуем
+  })();
+  </script>
+</body>
+</html>
